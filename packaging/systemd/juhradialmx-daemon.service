@@ -25,6 +25,15 @@ PartOf=graphical-session.target
 # D-Bus session is required for communication with KWin
 Requires=dbus.socket
 
+# Restart rate-limit lives in [Unit] (systemd ≥ 229). Older versions of
+# this file had it in [Service], where modern systemd silently ignores it
+# ("Unknown key in section [Service], ignoring"), so the documented burst
+# value never took effect. Burst raised to 20 so a brief storm of HID++
+# reconnects (Bolt receiver hand-off during USB suspend/resume) doesn't
+# permanently disable the service.
+StartLimitIntervalSec=60
+StartLimitBurst=20
+
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/juhradiald
@@ -38,13 +47,6 @@ ExecStart=/usr/local/bin/juhradiald
 # is always alive on the bus.
 Restart=always
 RestartSec=5s
-
-# Limit restart attempts to prevent infinite restart loops, but raise the
-# burst from 5 → 20 so a brief storm of HID++ reconnects (caused by Bolt
-# receiver hand-off during USB suspend/resume) doesn't permanently disable
-# the service.
-StartLimitIntervalSec=60
-StartLimitBurst=20
 
 # Disable watchdog to prevent systemd drop-ins (e.g. 10-timeout-abort.conf
 # on Fedora) from killing the daemon when it doesn't send sd_notify heartbeats.
