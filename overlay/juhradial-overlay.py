@@ -38,7 +38,10 @@ from PyQt6.QtCore import (
     QEasingCurve,
     QTimer,
     QRectF,
+    QPoint,
 )
+
+
 from PyQt6.QtGui import (
     QPainter,
     QBrush,
@@ -588,23 +591,96 @@ class RadialMenu(RadialMenuPaintingMixin, QWidget):
                 x, y = fresh_pos
                 _log(f"XWayland cursor position: ({x}, {y})")
 
-        # Detect which monitor the cursor is on and clamp menu to it
+        # Detect which monitor the cursor is on and clamp menu to it.
+        # Without clamping, a cursor near a monitor edge produces a menu
+        # that straddles two outputs; on GNOME Wayland's XWayland Mutter
+        # then migrates the whole window to the *wrong* output (the one
+        # with the smaller pixel coverage), which is what caused the
+        # "every other activation lands on the opposite monitor" bug on
+        # multi-monitor setups.
         if IS_HYPRLAND:
             mon = get_monitor_at_cursor(x, y)
             print(
                 f"OVERLAY: Monitor: {mon['name']} ({mon['width']}x{mon['height']} at {mon['x']},{mon['y']})"
             )
+        elif IS_GNOME:
+            # GNOME + xcb platform coordinate-space mismatch:
+            #   * Cursor coords from the helper extension are *Mutter
+            #     logical* pixels (e.g. 2048×2304 for our 1.25× stack).
+            #   * Qt's QScreen geometry and QWidget.move() under xcb
+            #     are in *X11 root* pixels — Qt rounds the 1.25× scale
+            #     up to dpr=2 and the X11 root is therefore 2× the
+            #     Mutter-logical desktop (so DP-1 sits at X11 y=2304,
+            #     not 1152).
+            # Convert cursor to the X11 root coord space by multiplying
+            # by Qt's reported dpr. Then screen detection, clamping,
+            # and move() all live in the same X11-root space.
+            dpr = QApplication.primaryScreen().devicePixelRatio() if QApplication.primaryScreen() else 1.0
+            x = int(round(x * dpr))
+            y = int(round(y * dpr))
+            # QApplication.screenAt() can't be used here because Qt's
+            # QScreen.geometry() under xcb has dpr-multiplied positions
+            # but logical-pixel sizes — the X11-coord cursor falls
+            # outside every QScreen rect and screenAt() returns None
+            # (silently falling back to primaryScreen and pinning the
+            # menu to the wrong output). Walk QApplication.screens()
+            # ourselves with each screen's geometry expanded to full
+            # X11-root pixels (width/height × that screen's dpr).
+            mon = None
+            for s in QApplication.screens():
+                g = s.geometry()
+                sd = s.devicePixelRatio()
+                sx, sy = g.x(), g.y()
+                sw, sh = int(g.width() * sd), int(g.height() * sd)
+                if sx <= x < sx + sw and sy <= y < sy + sh:
+                    mon = {
+                        "name": s.name(),
+                        "x": sx, "y": sy,
+                        "width": sw, "height": sh,
+                        "screen": s,
+                        "dpr": sd,
+                    }
+                    break
+            if mon is None:
+                # Cursor outside every screen rect (shouldn't happen
+                # in normal use). Fall back to primary so we still
+                # show the menu somewhere visible.
+                s = QApplication.primaryScreen()
+                if s is not None:
+                    g = s.geometry()
+                    sd = s.devicePixelRatio()
+                    mon = {
+                        "name": s.name(),
+                        "x": g.x(), "y": g.y(),
+                        "width": int(g.width() * sd),
+                        "height": int(g.height() * sd),
+                        "screen": s,
+                        "dpr": sd,
+                    }
+            if mon is not None:
+                _log(
+                    f"GNOME monitor for cursor x11=({x},{y}) dpr={dpr}: {mon['name']} "
+                    f"({mon['width']}x{mon['height']} at {mon['x']},{mon['y']})"
+                )
         else:
             mon = None
 
         print(f"OVERLAY: MenuRequested at ({x}, {y})")
         _log(f"MenuRequested final pos: ({x}, {y})")
 
-        # Clamp menu position to stay within the active monitor
+        # Clamp menu position to stay within the active monitor.
+        # On GNOME we work in X11-root pixels (cursor multiplied by dpr
+        # above), so the half-window must also be in X11 pixels:
+        # WINDOW_SIZE logical * dpr = full X11-pixel width, /2 = half.
+        # Elsewhere, mon is in logical pixels and so is half.
         half = WINDOW_SIZE // 2
         if mon:
-            x = max(mon["x"] + half, min(x, mon["x"] + mon["width"] - half))
-            y = max(mon["y"] + half, min(y, mon["y"] + mon["height"] - half))
+            if IS_GNOME and "dpr" in mon:
+                clamp_half = int(WINDOW_SIZE * mon["dpr"]) // 2
+            else:
+                clamp_half = half
+            x = max(mon["x"] + clamp_half, min(x, mon["x"] + mon["width"] - clamp_half))
+            y = max(mon["y"] + clamp_half, min(y, mon["y"] + mon["height"] - clamp_half))
 
         self.menu_center_x = x
         self.menu_center_y = y
@@ -628,7 +704,54 @@ class RadialMenu(RadialMenuPaintingMixin, QWidget):
         # any visible frame at the wrong location on multi-monitor setups
         self.highlighted_slice = -1
         self.setWindowOpacity(0.0)
-        self.move(x - half, y - half)
+
+        if IS_GNOME and mon is not None:
+            # x, y are X11-root coords; clamp_half above is in X11
+            # pixels. Qt's QWidget.move() under xcb takes logical
+            # pixels, so derive a logical top-left as a starting hint.
+            dpr = mon["dpr"]
+            move_x = int(round(x / dpr)) - half
+            move_y = int(round(y / dpr)) - half
+            tl_x11_x = x - clamp_half  # X11 top-left
+            tl_x11_y = y - clamp_half
+
+            # Qt's move()/setGeometry under xcb silently clamps the
+            # window to its current QScreen's bounds, and setScreen()
+            # alone doesn't re-map the X11 surface. We sidestep both
+            # by issuing a raw XMoveWindow via xdotool — which uses
+            # absolute X11-root coords and ignores Qt's HiDPI scaling
+            # and screen-membership logic entirely.
+            self.move(move_x, move_y)
+            _log(
+                f"GNOME move: x11=({x},{y}) dpr={dpr} -> Qt move({move_x},{move_y}); "
+                f"will xdotool windowmove to ({tl_x11_x},{tl_x11_y}) on {mon['name']}"
+            )
+
+            wid = int(self.winId())
+            tlx, tly = tl_x11_x, tl_x11_y
+
+            def _xdotool_move():
+                try:
+                    subprocess.Popen(
+                        ["xdotool", "windowmove", str(wid), str(tlx), str(tly)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                except OSError as e:
+                    _log(f"xdotool windowmove failed: {e}")
+
+            QTimer.singleShot(0, _xdotool_move)
+
+            def _post_show():
+                wh2 = self.windowHandle()
+                geom = self.geometry()
+                screen_name = wh2.screen().name() if wh2 and wh2.screen() else "?"
+                _log(
+                    f"Post-show actual: widget.geometry()=({geom.x()},{geom.y()},"
+                    f"{geom.width()}x{geom.height()}) screen={screen_name}"
+                )
+            QTimer.singleShot(120, _post_show)
+        else:
+            self.move(x - half, y - half)
 
         # On KDE Plasma, XWayland windows show a frozen wallpaper rectangle
         # behind transparent areas (KWin caches the wallpaper). Two fixes:
@@ -1029,8 +1152,18 @@ class RadialMenu(RadialMenuPaintingMixin, QWidget):
         cx = self.menu_center_x
         cy = self.menu_center_y
 
-        dx = pos_x - cx
-        dy = pos_y - cy
+        if IS_GNOME:
+            # get_cursor_pos returns Mutter-logical pixels on GNOME,
+            # but menu_center is in X11-root pixels. Scale cursor up
+            # so both sides of the comparison match, then divide the
+            # delta by dpr to keep MENU_RADIUS / center_radius
+            # thresholds in their original logical-pixel units.
+            dpr = QApplication.primaryScreen().devicePixelRatio() if QApplication.primaryScreen() else 1.0
+            dx = (pos_x * dpr - cx) / dpr
+            dy = (pos_y * dpr - cy) / dpr
+        else:
+            dx = pos_x - cx
+            dy = pos_y - cy
         distance = math.hypot(dx, dy)
         center_radius = self._get_center_radius()
 
@@ -1114,12 +1247,41 @@ class RadialMenu(RadialMenuPaintingMixin, QWidget):
         return -1
 
     def mouseMoveEvent(self, event):
-        _log(f"mouseMoveEvent: toggle_mode={self.toggle_mode}")
         cx = WINDOW_SIZE / 2
         cy = WINDOW_SIZE / 2
-        pos = event.position()
-        dx = pos.x() - cx
-        dy = pos.y() - cy
+        if IS_GNOME:
+            # Convert QCursor.pos() (Qt mixed-coord, where DP-1 starts
+            # at logical y=2304 with logical height 1152 — i.e. each
+            # screen's *local* extent is logical pixels but screens
+            # are positioned in X11-root coords) back to absolute X11
+            # pixels so we can compare against menu_center_x/y, which
+            # is already in X11-root coords. Then divide the delta by
+            # dpr to get logical-pixel distances for the existing
+            # MENU_RADIUS / center_radius thresholds.
+            from PyQt6.QtGui import QCursor
+            qp = QCursor.pos()
+            qs = QApplication.screenAt(qp)
+            if qs is None:
+                qs = QApplication.primaryScreen()
+            qs_dpr = qs.devicePixelRatio()
+            sg = qs.geometry()
+            cursor_x11_x = sg.x() + (qp.x() - sg.x()) * qs_dpr
+            cursor_x11_y = sg.y() + (qp.y() - sg.y()) * qs_dpr
+            dx_x11 = cursor_x11_x - self.menu_center_x
+            dy_x11 = cursor_x11_y - self.menu_center_y
+            dx = dx_x11 / qs_dpr
+            dy = dy_x11 / qs_dpr
+            _log(
+                f"mouseMoveEvent toggle={self.toggle_mode} QCursor=({qp.x()},{qp.y()}) "
+                f"-> x11=({cursor_x11_x:.0f},{cursor_x11_y:.0f}) "
+                f"menu_x11=({self.menu_center_x},{self.menu_center_y}) "
+                f"dx={dx:.0f} dy={dy:.0f}"
+            )
+        else:
+            _log(f"mouseMoveEvent: toggle_mode={self.toggle_mode}")
+            pos = event.position()
+            dx = pos.x() - cx
+            dy = pos.y() - cy
         distance = math.hypot(dx, dy)
         center_radius = self._get_center_radius()
 
@@ -1268,10 +1430,25 @@ def create_tray_icon(app, radial_menu):
 
 
 if __name__ == "__main__":
+    # PassThrough HiDPI policy is set at the top of this file, before
+    # any QColor/QPixmap module-level instantiation locks it in.
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("JuhRadial MX")
     app.setDesktopFileName("juhradial-mx")
+
+    # Startup diagnostic: dump every screen's geometry so we can see
+    # whether the PassThrough policy actually affected this process.
+    print("=== screen layout at startup ===")
+    for _s in app.screens():
+        _g = _s.geometry()
+        _line = (
+            f"  {_s.name()}: geom=({_g.x()},{_g.y()},{_g.width()}x{_g.height()})  "
+            f"dpr={_s.devicePixelRatio()}  scale={_s.logicalDotsPerInch() / 96.0:.3f}"
+        )
+        print(_line)
+        _log(f"Screen layout: {_line.strip()}")
+    print("=== /screen layout ===")
 
     # Show splash screen immediately (before heavy loading)
     splash = SplashScreen()
