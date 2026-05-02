@@ -152,6 +152,14 @@ ICON_NAME_MAP = {
     "applications-science-symbolic": "ai",
 }
 
+# Reverse map used by overlay_painting._draw_icon as a fallback path:
+# when an internal icon ID has no hand-drawn SVG-style renderer (e.g.
+# "terminal", "browser", "calculator", or any future addition), we look
+# up the original freedesktop symbolic name and render it via the
+# system icon theme. Keeps icons working even when nobody has time to
+# hand-draw a bespoke version for every ICON_NAME_MAP entry.
+INTERNAL_TO_GTK = {v: k for k, v in ICON_NAME_MAP.items()}
+
 
 # =============================================================================
 # CONFIG LOADING

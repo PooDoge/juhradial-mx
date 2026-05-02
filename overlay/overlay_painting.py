@@ -22,6 +22,8 @@ from PyQt6.QtGui import (
     QFont,
     QFontMetrics,
     QPainterPath,
+    QIcon,
+    QPixmap,
 )
 
 import overlay_actions
@@ -869,6 +871,55 @@ class RadialMenuPaintingMixin:
             p.setPen(QPen(color))
             text_rect = QRectF(cx - s * 0.5, cy - s * 0.5, s, s)
             p.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, "?")
+
+        else:
+            # No hand-drawn renderer for this internal id — fall back to the
+            # system icon theme via QIcon. Reverse-look up the freedesktop
+            # symbolic name from overlay_actions.INTERNAL_TO_GTK and tint the
+            # rendered pixmap to the action color so it matches the slice
+            # palette. This is what makes ICON_NAME_MAP entries like
+            # "terminal" / "browser" / "calculator" / "volume_up" actually
+            # show up instead of drawing nothing.
+            gtk_name = overlay_actions.INTERNAL_TO_GTK.get(icon_type)
+            if gtk_name:
+                self._draw_themed_icon(p, cx, cy, gtk_name, size, color)
+
+    def _draw_themed_icon(self, p, cx, cy, theme_name, size, color):
+        """Render a freedesktop symbolic icon from QIcon, tinted to *color*.
+
+        Pixmaps are cached per (theme_name, pixel_size, color.rgb()) so the
+        per-frame paint cost stays negligible.
+        """
+        cache = getattr(self, "_themed_icon_cache", None)
+        if cache is None:
+            cache = {}
+            self._themed_icon_cache = cache
+
+        # Render at 2× the requested radius (full diameter pixmap).
+        target = max(8, int(size * 2))
+        cache_key = (theme_name, target, color.rgb())
+        pix = cache.get(cache_key)
+        if pix is None:
+            icon = QIcon.fromTheme(theme_name)
+            if icon.isNull():
+                return
+            src = icon.pixmap(target, target)
+            if src.isNull():
+                return
+            tinted = QPixmap(src.size())
+            tinted.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(tinted)
+            painter.drawPixmap(0, 0, src)
+            painter.setCompositionMode(
+                QPainter.CompositionMode.CompositionMode_SourceIn
+            )
+            painter.fillRect(tinted.rect(), color)
+            painter.end()
+            cache[cache_key] = tinted
+            pix = tinted
+
+        target_rect = QRectF(cx - size, cy - size, size * 2, size * 2)
+        p.drawPixmap(target_rect, pix, QRectF(pix.rect()))
 
     @staticmethod
     def _ease_out_back(t, overshoot=1.4):
